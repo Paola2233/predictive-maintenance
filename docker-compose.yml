@@ -1,0 +1,38 @@
+services:
+  # FastAPI ML model server
+  ml-server:
+    build:
+      context: .
+      dockerfile: ./mlServerDockerfile
+    container_name: ml-server
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./mlruns:/app/mlruns
+      - ./mlartifacts:/app/artifacts
+    environment:
+      - MLFLOW_TRACKING_URI=sqlite:///mlruns.db
+      - MLFLOW_ARTIFACT_ROOT=/app/artifacts
+      - MODEL_NAME=DecisionTreeModel
+      - PYTHONPATH=/app
+    command: python src/app.py
+    restart: unless-stopped
+    depends_on:
+      - mlflow-tracking
+
+  # MLflow tracking server
+  mlflow-tracking:
+    build:
+      context: .
+      dockerfile: ./mlFlowDockerfile
+    container_name: mlflow-tracking
+    ports:
+      - "5001:5000"
+    volumes:
+      - ./mlruns:/app/mlruns
+      - ./mlartifacts:/app/artifacts
+    environment:
+      - MLFLOW_TRACKING_URI=sqlite:///mlruns.db
+      - MLFLOW_ARTIFACT_ROOT=/app/artifacts
+    command: mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri sqlite:///mlruns.db --default-artifact-root ./artifacts
+    restart: unless-stopped

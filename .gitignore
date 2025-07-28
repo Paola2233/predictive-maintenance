@@ -208,3 +208,8 @@ __marimo__/
 
 # Data files
 data/
+
+# mlflow
+mlruns/
+mlartifacts/
+mlruns.db
