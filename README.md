@@ -36,25 +36,29 @@ This project implements a predictive maintenance system using machine learning, 
    git clone https://github.com/Paola2233/predictive-maintenance.git
    cd predictive-maintenance
    ```
-2. (Recommended) Create and activate a virtual environment for local development:
+2. Create and activate a virtual environment for local development:
    ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate
+   python3 -m venv venv
+   source venv/bin/activate
    ```
 3. Install dependencies:
    ```bash
    pip install -r requirements.txt
    ```
-4. Start with Docker Compose:
+4. Train the model and create artifacts
+    ```bash
+    python src/model/train.py
+    ```
+5. Start with Docker Compose:
    ```bash
    docker-compose up
    ```
 
-## *(Optional)* Data Processing and Training Pipelines
+## Data Processing and Training Pipelines
 
 The project includes scripts for processing data and training machine learning models. These pipelines can be executed from the command line.
 
-### Run Data Processing Pipeline
+### *(Optional)* Run Data Processing Pipeline
 To process the raw data and generate the processed dataset, run:
 ```bash
 python src/model/preprocessing.py
@@ -118,12 +122,17 @@ curl -X POST "http://localhost:8080/predict" \
   }'
 ```
 
+Response example:
+```json
+{"predictions":[0.0],"status":"success"}
+```
+
 ## MLflow Tracking UI
 To access the MLflow UI, run:
 ```bash
 mlflow ui --backend-store-uri sqlite:///mlruns.db
 ```
-Then open [http://localhost:5000](http://localhost:5000) in your browser.
+Then open [http://localhost:5001](http://localhost:5000) in your browser.
 
 ## License
 This project is licensed under the MIT License.
