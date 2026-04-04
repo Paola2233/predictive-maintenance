@@ -1,12 +1,27 @@
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
+import polars as pl
 import pandas as pd
 import logging
+import os
+
+from src.databases.bigquery import run_query, df_to_bigquery
 
 
 class DataPreprocessor:
-    def __init__(self, target_window_size:int=30):
+    def __init__(
+            self,
+            target_window_size: int = 30,
+        ):
         self.target_window_size = target_window_size
+
+        # GCP configuration from environment variables
+        self.project_id = os.environ.get('GCP_PROJECT_ID')
+        self.bucket_name = os.environ.get('GCS_BUCKET_NAME')
+
+        # Validate required environment variables
+        if not all([self.project_id, self.bucket_name]):
+            raise ValueError("Required environment variables (GCP_PROJECT_ID, GCS_BUCKET_NAME) are not set.")
 
         # Setup logging
         self.setup_logging()
@@ -16,74 +31,149 @@ class DataPreprocessor:
         self.logger = logging.getLogger(__name__)
 
     def _load_data(self):
-        """Load dataset from a CSV file."""
+        """Load dataset from GCS CSV files."""
         try:
-            self.errors = pd.read_csv('data/raw/PdM_errors.csv', parse_dates=['datetime']).sort_values(['machineID', 'datetime'])
-            self.failures = pd.read_csv('data/raw/PdM_failures.csv', parse_dates=['datetime']).sort_values(['machineID', 'datetime'])
-            self.machines = pd.read_csv('data/raw/PdM_machines.csv')
-            self.maintenance = pd.read_csv('data/raw/PdM_maint.csv', parse_dates=['datetime']).sort_values(['machineID', 'datetime'])
-            self.telemetry = pd.read_csv('data/raw/PdM_telemetry.csv', parse_dates=['datetime']).sort_values(['machineID', 'datetime'])
+            self.logger.info("Loading data from BigQuery...")
+
+            errors_df = run_query(f"""
+                SELECT * FROM `{self.project_id}.raw_data.PdM_errors`
+            """)
+            self.errors = errors_df.sort(['machineID', 'datetime'])
+
+            failures_df = run_query(f"""
+                SELECT * FROM `{self.project_id}.raw_data.PdM_failures`
+            """)
+            self.failures = failures_df.sort(['machineID', 'datetime'])
+
+            machines_df = run_query(f"""
+                SELECT * FROM `{self.project_id}.raw_data.PdM_machines`
+            """)
+            self.machines = machines_df
+
+            maintenance_df = run_query(f"""
+                SELECT * FROM `{self.project_id}.raw_data.PdM_maint`
+            """)
+            self.maintenance = maintenance_df.sort(['machineID', 'datetime'])
+
+            telemetry_df = run_query(f"""
+                SELECT * FROM `{self.project_id}.raw_data.PdM_telemetry`
+            """)
+            self.telemetry = telemetry_df.sort(['machineID', 'datetime'])
         except Exception as e:
-            self.logger.error(f"Error loading data: {str(e)}")
+            self.logger.error(f"Error loading data from BigQuery: {str(e)}")
             raise e
 
     def _telemetry_grouping(self):
         """Group telemetry data by date and machineID, aggregating features."""
         try:
-            self.telemetry = self.telemetry.sort_values(['machineID', 'datetime'])
-            self.telemetry['date'] = self.telemetry['datetime'].dt.normalize()
-            self.telemetry_grouped = self.telemetry.groupby(by=['date', 'machineID']) \
-                .agg({'volt': 'mean', 'rotate': 'mean', 'pressure': 'mean', 'vibration': 'mean'}).reset_index()
+            self.telemetry_grouped = (
+                self.telemetry
+                .with_columns(
+                    pl.col('datetime').dt.truncate('1d').alias('date')
+                )
+                .group_by(['date', 'machineID'])
+                .agg([
+                    pl.col('volt').mean(),
+                    pl.col('rotate').mean(),
+                    pl.col('pressure').mean(),
+                    pl.col('vibration').mean()
+                ])
+            )
         except Exception as e:
             self.logger.error(f"Error grouping telemetry data: {str(e)}")
             raise e
 
-    def _add_features(self, df: pd.DataFrame, type_name: str, window_sizes: list = [7, 14, 30]):
+    def _add_features(self, df: pl.DataFrame, type_name: str, window_sizes: list = [7, 14, 30]):
         """Add rolling features for errors, failures, and maintenance."""
         try:
-            df = df.sort_values(['machineID', 'datetime'])
-            df['date'] = df['datetime'].dt.normalize()
+            df_with_date = df.with_columns(
+                pl.col('datetime').dt.truncate('1d').alias('date')
+            )
 
-            for idx, row in self.telemetry_grouped.iterrows():
-                current_date = row['date']
-                machine = row['machineID']
+            for window in window_sizes:
+                # For each row in telemetry_grouped, count events within the window
+                feature_col = f'{type_name}_last_{window}_days'
 
-                # Filter rows for the same machine in a window
-                for window in window_sizes:
-                    # Create a mask for the last 'window' days
-                    mask = (
-                        (df['machineID'] == machine) &
-                        (df['date'] >= current_date - pd.Timedelta(days=window)) &
-                        (df['date'] <= current_date)
-                    )
+                # Cross join telemetry_grouped with the event dataframe
+                joined = self.telemetry_grouped.join(
+                    df_with_date,
+                    left_on='machineID',
+                    right_on='machineID',
+                    how='left'
+                )
 
-                    # Count how many errors, failures or maintenance occurred in that window
-                    self.telemetry_grouped.at[idx, f'{type_name}_last_{window}_days'] = mask.sum()
+                # Filter for events within the window
+                filtered = joined.filter(
+                    (pl.col('date_right') >= pl.col('date') - pl.duration(days=window)) &
+                    (pl.col('date_right') <= pl.col('date'))
+                )
+
+                # Count events per telemetry row
+                counts = filtered.group_by(
+                    ['date', 'machineID']
+                ).agg(
+                    pl.len().alias(feature_col)
+                )
+
+                # Join back to telemetry_grouped
+                self.telemetry_grouped = self.telemetry_grouped.join(
+                    counts,
+                    on=['date', 'machineID'],
+                    how='left'
+                ).with_columns(
+                    pl.col(feature_col).fill_null(0)
+                )
         except Exception as e:
             self.logger.error(f"Error adding features: {str(e)}")
             raise e
 
-    def _add_target_feature(self, df: pd.DataFrame, window_size: int = 30):
+    def _add_target_feature(self, df: pl.DataFrame, window_size: int = 30):
         """Add target feature indicating if a machine will fail in the next 'window_size' days."""
         try:
-            df = df.sort_values(['machineID', 'datetime'])
-            df['date'] = df['datetime'].dt.normalize()
+            df_with_date = df.with_columns(
+                pl.col('datetime').dt.truncate('1d').alias('date')
+            )
 
-            for idx, row in self.telemetry_grouped.iterrows():
-                current_date = row['date']
-                machine = row['machineID']
+            # Cross join to match each telemetry row with failures
+            joined = self.telemetry_grouped.join(
+                df_with_date,
+                left_on='machineID',
+                right_on='machineID',
+                how='left'
+            )
 
-                mask = (
-                    (df['machineID'] == machine) &
-                    (df['date'] <= current_date + pd.Timedelta(days=window_size)) &
-                    (df['date'] >= current_date)
-                )
+            # Filter for failures within the next 'window_size' days
+            target_filtered = joined.filter(
+                (pl.col('date_right') <= pl.col('date') + pl.duration(days=window_size)) &
+                (pl.col('date_right') >= pl.col('date'))
+            )
 
-                # See if there are any failures in the next 'window_size' days
-                will_fail = 1 if mask.sum() > 0 else 0
-                self.telemetry_grouped.at[idx, f'will_fail_{window_size}_days'] = will_fail
+            # Check if there are any failures in the future window
+            target_feature = target_filtered.group_by(
+                ['date', 'machineID']
+            ).agg(
+                (pl.len() > 0).cast(pl.Int64).alias(f'will_fail_{window_size}_days')
+            )
+
+            # Join back to telemetry_grouped
+            self.telemetry_grouped = self.telemetry_grouped.join(
+                target_feature,
+                on=['date', 'machineID'],
+                how='left'
+            ).with_columns(
+                pl.col(f'will_fail_{window_size}_days').fill_null(0)
+            )
         except Exception as e:
             self.logger.error(f"Error adding target feature: {str(e)}")
+            raise e
+
+    def save_to_bigquery(self, df: pl.DataFrame, dataset: str, table: str):
+        """Save the processed DataFrame to BigQuery."""
+        try:
+            df_to_bigquery(df, dataset, table)
+            self.logger.info(f"Processed features saved to BigQuery table '{dataset}.{table}'")
+        except Exception as e:
+            self.logger.error(f"Error saving to BigQuery: {str(e)}")
             raise e
 
     def create_features(self, save_df: bool = True):
@@ -100,12 +190,25 @@ class DataPreprocessor:
         # Adding target feature for future failures
         self._add_target_feature(self.failures, window_size=self.target_window_size)
 
-        final_df = self.telemetry_grouped.merge(self.machines, on='machineID', how='left')
-        final_df['model'] = final_df['model'].replace({'model1': 0, 'model2': 1, 'model3': 2, 'model4': 3})
+        # Join with machines data
+        final_df = self.telemetry_grouped.join(
+            self.machines,
+            left_on='machineID',
+            right_on='machineID',
+            how='left'
+        )
+
+        # Map model values
+        model_mapping = {'model1': 0, 'model2': 1, 'model3': 2, 'model4': 3}
+        final_df = final_df.with_columns(
+            pl.col('model').map_elements(
+                lambda x: model_mapping.get(x, x),
+                return_dtype=pl.Int64
+            )
+        )
 
         if save_df:
-            final_df.to_csv('data/processed/telemetry.csv', index=False)
-            self.logger.info("Processed features saved to 'data/processed/telemetry.csv'")
+            self.save_to_bigquery(final_df, dataset='preprocessed_data', table='features_engineered_v2')
         return final_df
 
 if __name__ == "__main__":

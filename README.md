@@ -29,6 +29,7 @@ This project implements a predictive maintenance system using machine learning, 
 * Python 3.12
 * Docker & Docker Compose
 * Jupyter Notebook (for running notebooks)
+* [UV installed](https://docs.astral.sh/uv/getting-started/installation/#pypi)
 
 ### Installation
 1. Clone the repository:
