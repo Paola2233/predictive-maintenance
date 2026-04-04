@@ -1,9 +1,11 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import os
 import logging
+import os
+
 import mlflow
 import uvicorn
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
 from model.MLflowModelServer import MLflowModelServer
 
 # Configure logging
@@ -68,5 +70,5 @@ if __name__ == '__main__':
     except Exception as e:
         logger.warning(f"Could not load model on startup: {str(e)}")
 
-    logger.info(f"Starting ML model server on localhost:8080...")
+    logger.info("Starting ML model server on localhost:8080...")
     uvicorn.run(app, host='0.0.0.0', port=8080)

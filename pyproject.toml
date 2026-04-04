@@ -21,3 +21,13 @@ dependencies = [
     "seaborn>=0.13.2",
     "xgboost>=3.0.2",
 ]
+
+[dependency-groups]
+dev = [
+    "black>=26.3.1",
+    "ruff>=0.15.9",
+]
+
+[tool.ruff.lint]
+# Añade "I" a las reglas seleccionadas por defecto
+extend-select = ["I"]

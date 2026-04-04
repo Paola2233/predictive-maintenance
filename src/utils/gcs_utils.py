@@ -1,7 +1,6 @@
 import os
 
-from google.cloud import storage, bigquery
-
+from google.cloud import bigquery, storage
 
 PROJECT_ID = os.environ.get('GCP_PROJECT_ID')
 

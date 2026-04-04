@@ -1,15 +1,16 @@
 import warnings
 
 import mlflow.tracking
+
 warnings.simplefilter(action='ignore', category=FutureWarning)
 import logging
-import pandas as pd
+import os
+
 import mlflow
 import mlflow.pyfunc
 import numpy as np
-import os
+import pandas as pd
 from sklearn.preprocessing import StandardScaler
-
 
 MLFLOW_TRACKING_URI = os.getenv('MLFLOW_TRACKING_URI', 'sqlite:///mlruns.db')
 

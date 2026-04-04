@@ -1,4 +1,5 @@
-from utils.gcs_utils import upload_to_bucket, load_csv_to_bigquery
+from utils.gcs_utils import load_csv_to_bigquery, upload_to_bucket
+
 
 def upload_raw_sensor_data():
     """Uploads raw data files to GCS."""

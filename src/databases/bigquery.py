@@ -1,8 +1,8 @@
 import io
 import os
+
 import polars as pl
 from google.cloud import bigquery
-
 
 PROJECT_ID = os.environ.get('GCP_PROJECT_ID')
 

@@ -1,3 +1,6 @@
+import logging
+import os
+
 import mlflow
 import mlflow.sklearn
 import pandas as pd
@@ -5,9 +8,6 @@ from sklearn.metrics import classification_report
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeClassifier
-import logging
-import os
-
 
 MODEL_NAME = os.getenv('MODEL_NAME', 'DecisionTreeModel')
 MLFLOW_TRACKING_URI = os.getenv('MLFLOW_TRACKING_URI', 'sqlite:///mlruns.db')

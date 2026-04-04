@@ -1,11 +1,12 @@
 import warnings
+
 warnings.simplefilter(action='ignore', category=FutureWarning)
-import polars as pl
-import pandas as pd
 import logging
 import os
 
-from src.databases.bigquery import run_query, df_to_bigquery
+import polars as pl
+
+from src.databases.bigquery import df_to_bigquery, run_query
 
 
 class DataPreprocessor:
