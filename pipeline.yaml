@@ -1,0 +1,440 @@
+# PIPELINE DEFINITION
+# Name: predictive-maintenance-xgboost-v3
+# Description: Predictive maintenance: feature engineering → XGBoost (TimeSeriesSplit) → Vertex AI Experiment → Model Registry → conditional Endpoint deploy
+# Inputs:
+#    bq_dataset: str [Default: 'preprocessed_data']
+#    bq_table: str [Default: 'features_engineered_v2']
+#    bucket_name: str
+#    colsample_bytree: float [Default: 0.8]
+#    endpoint_display_name: str [Default: 'predictive-maintenance-endpoint']
+#    learning_rate: float [Default: 0.05]
+#    machine_type: str [Default: 'n1-standard-4']
+#    max_depth: int [Default: 6.0]
+#    model_name: str [Default: 'XGBoostPredictiveMaintenance']
+#    n_cv_splits: int [Default: 5.0]
+#    n_estimators: int [Default: 300.0]
+#    project_id: str
+#    region: str [Default: 'us-central1']
+#    roc_auc_threshold: float [Default: 0.75]
+#    subsample: float [Default: 0.8]
+#    target_window_size: int [Default: 30.0]
+#    vertex_experiment: str [Default: 'pdm-xgboost-experiment']
+components:
+  comp-evaluate-component:
+    executorLabel: exec-evaluate-component
+    inputDefinitions:
+      artifacts:
+        input_model:
+          artifactType:
+            schemaTitle: system.Model
+            schemaVersion: 0.0.1
+      parameters:
+        project_id:
+          parameterType: STRING
+        region:
+          parameterType: STRING
+        roc_auc_threshold:
+          parameterType: NUMBER_DOUBLE
+    outputDefinitions:
+      artifacts:
+        approved_model:
+          artifactType:
+            schemaTitle: system.Model
+            schemaVersion: 0.0.1
+      parameters:
+        approved:
+          parameterType: BOOLEAN
+  comp-preprocess-component:
+    executorLabel: exec-preprocess-component
+    inputDefinitions:
+      parameters:
+        bq_dataset:
+          parameterType: STRING
+        bq_table:
+          parameterType: STRING
+        bucket_name:
+          parameterType: STRING
+        project_id:
+          parameterType: STRING
+        target_window_size:
+          parameterType: NUMBER_INTEGER
+  comp-train-component:
+    executorLabel: exec-train-component
+    inputDefinitions:
+      parameters:
+        bq_dataset:
+          parameterType: STRING
+        bq_table:
+          parameterType: STRING
+        bucket_name:
+          parameterType: STRING
+        colsample_bytree:
+          parameterType: NUMBER_DOUBLE
+        learning_rate:
+          parameterType: NUMBER_DOUBLE
+        max_depth:
+          parameterType: NUMBER_INTEGER
+        model_name:
+          parameterType: STRING
+        n_cv_splits:
+          parameterType: NUMBER_INTEGER
+        n_estimators:
+          parameterType: NUMBER_INTEGER
+        project_id:
+          parameterType: STRING
+        region:
+          parameterType: STRING
+        subsample:
+          parameterType: NUMBER_DOUBLE
+        vertex_experiment:
+          parameterType: STRING
+    outputDefinitions:
+      artifacts:
+        output_metrics:
+          artifactType:
+            schemaTitle: system.Metrics
+            schemaVersion: 0.0.1
+        output_model:
+          artifactType:
+            schemaTitle: system.Model
+            schemaVersion: 0.0.1
+      parameters:
+        artifact_uri:
+          parameterType: STRING
+        f1_macro:
+          parameterType: NUMBER_DOUBLE
+        roc_auc:
+          parameterType: NUMBER_DOUBLE
+deploymentSpec:
+  executors:
+    exec-evaluate-component:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - evaluate_component
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'google-cloud-aiplatform>=1.40'\
+          \  &&  python3 -m pip install --quiet --no-warn-script-location 'kfp==2.16.0'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"\
+          $0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef evaluate_component(\n    input_model: Input[Model],\n    project_id:\
+          \ str,\n    region: str,\n    roc_auc_threshold: float,\n    approved_model:\
+          \ Output[Model],\n) -> NamedTuple(\"EvalOutputs\", [(\"approved\", bool)]):\n\
+          \    \"\"\"\n    Quality gate: reads the CV ROC-AUC from the train component's\
+          \ JSON summary.\n    If it meets the threshold, the model resource name\
+          \ is forwarded to the\n    deploy component.  Otherwise the deploy step\
+          \ is skipped via dsl.If().\n\n    The model is already registered in Vertex\
+          \ AI Model Registry at this point\n    (the train component did it). This\
+          \ gate controls whether it gets *deployed*.\n    \"\"\"\n    import json\n\
+          \    import logging\n    from collections import namedtuple\n    import\
+          \ google.cloud.aiplatform as aip\n\n    logging.basicConfig(level=logging.INFO)\n\
+          \    logger = logging.getLogger(\"evaluate\")\n\n    with open(input_model.path)\
+          \ as fh:\n        summary = json.load(fh)\n\n    roc_auc       = float(summary.get(\"\
+          roc_auc\", 0))\n    resource_name = summary.get(\"resource_name\", \"\"\
+          )\n    approved      = roc_auc >= roc_auc_threshold\n\n    logger.info(\n\
+          \        f\"ROC-AUC={roc_auc:.4f}  threshold={roc_auc_threshold}  \"\n \
+          \       f\"\u2192 {'APPROVED \u2713' if approved else 'REJECTED \u2717'}\"\
+          \n    )\n\n    # Forward metadata so deploy_component knows which model\
+          \ to deploy\n    approved_model.metadata[\"resource_name\"] = resource_name\
+          \ if approved else \"\"\n    approved_model.metadata[\"roc_auc\"]      \
+          \ = roc_auc\n    approved_model.metadata[\"approved\"]      = approved\n\
+          \n    # Write the same summary so the artefact path is not empty\n    with\
+          \ open(approved_model.path, \"w\") as fh:\n        json.dump({**summary,\
+          \ \"approved\": approved}, fh)\n\n    EvalOutputs = namedtuple(\"EvalOutputs\"\
+          , [\"approved\"])\n    return EvalOutputs(approved=approved)\n\n"
+        image: us-central1-docker.pkg.dev/abiding-kingdom-491823-b0/predictive-maintenance-repo/predictive-maintenance:v1
+    exec-preprocess-component:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - preprocess_component
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'polars>=0.20'\
+          \ 'google-cloud-bigquery>=3.0' 'db-dtypes' 'pyarrow' 'google-cloud-storage'\
+          \  &&  python3 -m pip install --quiet --no-warn-script-location 'kfp==2.16.0'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"\
+          $0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef preprocess_component(\n    project_id: str,\n    bucket_name:\
+          \ str,\n    target_window_size: int,\n    bq_dataset: str,\n    bq_table:\
+          \ str,\n):\n    \"\"\"\n    Runs DataPreprocessor:\n      \u2022 Loads raw\
+          \ tables from BigQuery (raw_data dataset)\n      \u2022 Engineers rolling-window\
+          \ telemetry features + lag counts + target label\n      \u2022 Saves the\
+          \ result to BigQuery (preprocessed_data dataset)\n\n    No local file or\
+          \ KFP artifact is produced \u2014 BigQuery is the handoff\n    between this\
+          \ component and the train component.\n    \"\"\"\n    import os\n    import\
+          \ logging\n\n    logging.basicConfig(level=logging.INFO)\n    logger = logging.getLogger(\"\
+          preprocess\")\n\n    os.environ[\"GCP_PROJECT_ID\"] = project_id\n    os.environ[\"\
+          GCS_BUCKET_NAME\"] = bucket_name\n\n    from src.model.preprocessing import\
+          \ DataPreprocessor\n\n    preprocessor = DataPreprocessor(target_window_size=target_window_size)\n\
+          \    df = preprocessor.create_features(save_df=True)\n\n    logger.info(\n\
+          \        f\"Preprocessing complete: {df.shape[0]:,} rows \xD7 {df.shape[1]}\
+          \ cols \"\n        f\"\u2192 BigQuery {project_id}.{bq_dataset}.{bq_table}\"\
+          \n    )\n\n"
+        image: us-central1-docker.pkg.dev/abiding-kingdom-491823-b0/predictive-maintenance-repo/predictive-maintenance:v1
+    exec-train-component:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - train_component
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'xgboost>=2.0'\
+          \ 'scikit-learn>=1.3' 'pandas>=2.0' 'numpy' 'google-cloud-bigquery>=3.0'\
+          \ 'db-dtypes' 'google-cloud-storage' 'google-cloud-aiplatform>=1.40'  &&\
+          \  python3 -m pip install --quiet --no-warn-script-location 'kfp==2.16.0'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"\
+          $0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef train_component(\n    project_id: str,\n    region: str,\n  \
+          \  bucket_name: str,\n    model_name: str,\n    vertex_experiment: str,\n\
+          \    bq_dataset: str,\n    bq_table: str,\n    n_estimators: int,\n    max_depth:\
+          \ int,\n    learning_rate: float,\n    subsample: float,\n    colsample_bytree:\
+          \ float,\n    n_cv_splits: int,\n    output_model: Output[Model],\n    output_metrics:\
+          \ Output[Metrics],\n) -> NamedTuple(\"TrainOutputs\", [(\"roc_auc\", float),\
+          \ (\"f1_macro\", float), (\"artifact_uri\", str)]):\n    \"\"\"\n    Calls\
+          \ XGBoostTrainer.train():\n      \u2022 Reads features directly from BigQuery\
+          \ (no local CSV)\n      \u2022 TimeSeriesSplit cross-validation\n      \u2022\
+          \ Saves model.bst + scaler.pkl + feature_names.json to GCS\n      \u2022\
+          \ Logs params + metrics to a Vertex AI Experiment run\n      \u2022 Registers\
+          \ the model in Vertex AI Model Registry\n      \u2022 Returns CV metrics\
+          \ for the evaluation gate\n\n    trainer.train() returns a dict \u2014 artifact_uri\
+          \ and resource_name are\n    taken from that dict directly, since aiplatform.Model\
+          \ does not expose\n    artifact_uri as an attribute after Model.upload().\n\
+          \    \"\"\"\n    import os\n    import json\n    from collections import\
+          \ namedtuple\n\n    os.environ[\"GCP_PROJECT_ID\"]    = project_id\n   \
+          \ os.environ[\"GCP_REGION\"]        = region\n    os.environ[\"GCS_BUCKET_NAME\"\
+          ]   = bucket_name\n    os.environ[\"MODEL_NAME\"]        = model_name\n\
+          \    os.environ[\"VERTEX_EXPERIMENT\"] = vertex_experiment\n    os.environ[\"\
+          BQ_DATASET\"]        = bq_dataset\n    os.environ[\"BQ_TABLE\"]        \
+          \  = bq_table\n\n    from src.model.xg_boost_trainer import XGBoostTrainer\n\
+          \n    trainer = XGBoostTrainer(\n        n_estimators     = n_estimators,\n\
+          \        max_depth        = max_depth,\n        learning_rate    = learning_rate,\n\
+          \        subsample        = subsample,\n        colsample_bytree = colsample_bytree,\n\
+          \        n_cv_splits      = n_cv_splits,\n        bq_dataset       = bq_dataset,\n\
+          \        bq_table         = bq_table,\n    )\n\n    # train() returns a\
+          \ dict: {vertex_model, resource_name, artifact_uri, cv_metrics}\n    result\
+          \ = trainer.train()\n\n    resource_name = result[\"resource_name\"]\n \
+          \   artifact_uri  = result[\"artifact_uri\"]\n    cv_metrics    = result[\"\
+          cv_metrics\"]\n    roc_auc       = float(cv_metrics.get(\"cv_roc_auc\",\
+          \ 0.0))\n    f1_macro      = float(cv_metrics.get(\"cv_f1_macro\", 0.0))\n\
+          \n    # Surface metrics in the KFP / Vertex AI Pipelines UI\n    output_metrics.log_metric(\"\
+          cv_roc_auc\", roc_auc)\n    output_metrics.log_metric(\"cv_f1_macro\", f1_macro)\n\
+          \    output_metrics.log_metric(\"cv_recall_1\", float(cv_metrics.get(\"\
+          cv_recall_1\", 0.0)))\n\n    # Write JSON summary so evaluate_component\
+          \ can read it\n    summary = {\n        \"resource_name\": resource_name,\n\
+          \        \"artifact_uri\":  artifact_uri,\n        \"roc_auc\":       roc_auc,\n\
+          \        \"f1_macro\":      f1_macro,\n    }\n    with open(output_model.path,\
+          \ \"w\") as fh:\n        json.dump(summary, fh)\n\n    output_model.metadata[\"\
+          resource_name\"] = resource_name\n    output_model.metadata[\"artifact_uri\"\
+          ]  = artifact_uri\n\n    TrainOutputs = namedtuple(\"TrainOutputs\", [\"\
+          roc_auc\", \"f1_macro\", \"artifact_uri\"])\n    return TrainOutputs(roc_auc=roc_auc,\
+          \ f1_macro=f1_macro, artifact_uri=artifact_uri)\n\n"
+        image: us-central1-docker.pkg.dev/abiding-kingdom-491823-b0/predictive-maintenance-repo/predictive-maintenance:v1
+        resources:
+          cpuLimit: 4.0
+          memoryLimit: 16.0
+          resourceCpuLimit: '4'
+          resourceMemoryLimit: 16G
+pipelineInfo:
+  description: "Predictive maintenance: feature engineering \u2192 XGBoost (TimeSeriesSplit)\
+    \ \u2192 Vertex AI Experiment \u2192 Model Registry \u2192 conditional Endpoint\
+    \ deploy"
+  name: predictive-maintenance-xgboost-v3
+root:
+  dag:
+    tasks:
+      evaluate-component:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-evaluate-component
+        dependentTasks:
+        - train-component
+        inputs:
+          artifacts:
+            input_model:
+              taskOutputArtifact:
+                outputArtifactKey: output_model
+                producerTask: train-component
+          parameters:
+            project_id:
+              componentInputParameter: project_id
+            region:
+              componentInputParameter: region
+            roc_auc_threshold:
+              componentInputParameter: roc_auc_threshold
+        taskInfo:
+          name: Evaluate & Quality Gate
+      preprocess-component:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-preprocess-component
+        inputs:
+          parameters:
+            bq_dataset:
+              componentInputParameter: bq_dataset
+            bq_table:
+              componentInputParameter: bq_table
+            bucket_name:
+              componentInputParameter: bucket_name
+            project_id:
+              componentInputParameter: project_id
+            target_window_size:
+              componentInputParameter: target_window_size
+        taskInfo:
+          name: Feature Engineering
+      train-component:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-train-component
+        dependentTasks:
+        - preprocess-component
+        inputs:
+          parameters:
+            bq_dataset:
+              componentInputParameter: bq_dataset
+            bq_table:
+              componentInputParameter: bq_table
+            bucket_name:
+              componentInputParameter: bucket_name
+            colsample_bytree:
+              componentInputParameter: colsample_bytree
+            learning_rate:
+              componentInputParameter: learning_rate
+            max_depth:
+              componentInputParameter: max_depth
+            model_name:
+              componentInputParameter: model_name
+            n_cv_splits:
+              componentInputParameter: n_cv_splits
+            n_estimators:
+              componentInputParameter: n_estimators
+            project_id:
+              componentInputParameter: project_id
+            region:
+              componentInputParameter: region
+            subsample:
+              componentInputParameter: subsample
+            vertex_experiment:
+              componentInputParameter: vertex_experiment
+        taskInfo:
+          name: XGBoost Training
+  inputDefinitions:
+    parameters:
+      bq_dataset:
+        defaultValue: preprocessed_data
+        isOptional: true
+        parameterType: STRING
+      bq_table:
+        defaultValue: features_engineered_v2
+        isOptional: true
+        parameterType: STRING
+      bucket_name:
+        parameterType: STRING
+      colsample_bytree:
+        defaultValue: 0.8
+        isOptional: true
+        parameterType: NUMBER_DOUBLE
+      endpoint_display_name:
+        defaultValue: predictive-maintenance-endpoint
+        isOptional: true
+        parameterType: STRING
+      learning_rate:
+        defaultValue: 0.05
+        isOptional: true
+        parameterType: NUMBER_DOUBLE
+      machine_type:
+        defaultValue: n1-standard-4
+        isOptional: true
+        parameterType: STRING
+      max_depth:
+        defaultValue: 6.0
+        isOptional: true
+        parameterType: NUMBER_INTEGER
+      model_name:
+        defaultValue: XGBoostPredictiveMaintenance
+        isOptional: true
+        parameterType: STRING
+      n_cv_splits:
+        defaultValue: 5.0
+        isOptional: true
+        parameterType: NUMBER_INTEGER
+      n_estimators:
+        defaultValue: 300.0
+        isOptional: true
+        parameterType: NUMBER_INTEGER
+      project_id:
+        parameterType: STRING
+      region:
+        defaultValue: us-central1
+        isOptional: true
+        parameterType: STRING
+      roc_auc_threshold:
+        defaultValue: 0.75
+        isOptional: true
+        parameterType: NUMBER_DOUBLE
+      subsample:
+        defaultValue: 0.8
+        isOptional: true
+        parameterType: NUMBER_DOUBLE
+      target_window_size:
+        defaultValue: 30.0
+        isOptional: true
+        parameterType: NUMBER_INTEGER
+      vertex_experiment:
+        defaultValue: pdm-xgboost-experiment
+        isOptional: true
+        parameterType: STRING
+schemaVersion: 2.1.0
+sdkVersion: kfp-2.16.0
