@@ -198,21 +198,22 @@ class DataPreprocessor:
 
             target_filtered = joined.filter(
                 (pl.col('date_right') <= pl.col('date') + pl.duration(days=window_size)) &
-                (pl.col('date_right') >= pl.col('date'))
-            )
-
-            target_feature = target_filtered.group_by(
-                ['date', 'machineID']
-            ).agg(
-                (pl.len() > 0).cast(pl.Int64).alias(f'will_fail_{window_size}_days')
+                (pl.col('date_right') > pl.col('date'))  # ← exclude same-day (future only)
+            ).with_columns(
+                # Days until the nearest upcoming failure
+                (pl.col('date_right') - pl.col('date')).dt.total_days().alias('days_until_failure')
+            ).group_by(['date', 'machineID']).agg(
+                (pl.len() > 0).cast(pl.Int64).alias(f'will_fail_{window_size}_days'),
+                pl.col('days_until_failure').min().alias('days_until_failure')  # nearest failure
             )
 
             self.telemetry_grouped = self.telemetry_grouped.join(
-                target_feature,
+                target_filtered,
                 on=['date', 'machineID'],
                 how='left'
             ).with_columns(
-                pl.col(f'will_fail_{window_size}_days').fill_null(0)
+                pl.col(f'will_fail_{window_size}_days').fill_null(0),
+                pl.col('days_until_failure').fill_null(999)  # 999 = no failure upcoming
             )
 
         except Exception as e:
@@ -276,5 +277,5 @@ class DataPreprocessor:
 
 
 if __name__ == "__main__":
-    preprocessor = DataPreprocessor(target_window_size=30)
+    preprocessor = DataPreprocessor(target_window_size=7)
     processed_data = preprocessor.create_features()

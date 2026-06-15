@@ -7,17 +7,20 @@
 #    bucket_name: str
 #    colsample_bytree: float [Default: 0.8]
 #    endpoint_display_name: str [Default: 'predictive-maintenance-endpoint']
+#    f2_score_threshold: float [Default: 0.4]
 #    learning_rate: float [Default: 0.05]
 #    machine_type: str [Default: 'n1-standard-4']
 #    max_depth: int [Default: 6.0]
 #    model_name: str [Default: 'XGBoostPredictiveMaintenance']
 #    n_cv_splits: int [Default: 5.0]
 #    n_estimators: int [Default: 300.0]
+#    pr_auc_threshold: float [Default: 0.5]
 #    project_id: str
+#    recall_pos_threshold: float [Default: 0.6]
 #    region: str [Default: 'us-central1']
 #    roc_auc_threshold: float [Default: 0.75]
 #    subsample: float [Default: 0.8]
-#    target_window_size: int [Default: 30.0]
+#    target_window_size: int [Default: 7.0]
 #    vertex_experiment: str [Default: 'pdm-xgboost-experiment']
 components:
   comp-evaluate-component:
@@ -29,8 +32,14 @@ components:
             schemaTitle: system.Model
             schemaVersion: 0.0.1
       parameters:
+        f2_score_threshold:
+          parameterType: NUMBER_DOUBLE
+        pr_auc_threshold:
+          parameterType: NUMBER_DOUBLE
         project_id:
           parameterType: STRING
+        recall_pos_threshold:
+          parameterType: NUMBER_DOUBLE
         region:
           parameterType: STRING
         roc_auc_threshold:
@@ -40,6 +49,14 @@ components:
         approved_model:
           artifactType:
             schemaTitle: system.Model
+            schemaVersion: 0.0.1
+        eval_clf_metrics:
+          artifactType:
+            schemaTitle: system.ClassificationMetrics
+            schemaVersion: 0.0.1
+        eval_metrics:
+          artifactType:
+            schemaTitle: system.Metrics
             schemaVersion: 0.0.1
       parameters:
         approved:
@@ -90,6 +107,10 @@ components:
           parameterType: STRING
     outputDefinitions:
       artifacts:
+        output_clf_metrics:
+          artifactType:
+            schemaTitle: system.ClassificationMetrics
+            schemaVersion: 0.0.1
         output_metrics:
           artifactType:
             schemaTitle: system.Metrics
@@ -101,7 +122,13 @@ components:
       parameters:
         artifact_uri:
           parameterType: STRING
-        f1_macro:
+        f2_score:
+          parameterType: NUMBER_DOUBLE
+        pr_auc:
+          parameterType: NUMBER_DOUBLE
+        recall_neg:
+          parameterType: NUMBER_DOUBLE
+        recall_pos:
           parameterType: NUMBER_DOUBLE
         roc_auc:
           parameterType: NUMBER_DOUBLE
@@ -135,30 +162,98 @@ deploymentSpec:
           '
         - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
           \ *\n\ndef evaluate_component(\n    input_model: Input[Model],\n    project_id:\
-          \ str,\n    region: str,\n    roc_auc_threshold: float,\n    approved_model:\
-          \ Output[Model],\n) -> NamedTuple(\"EvalOutputs\", [(\"approved\", bool)]):\n\
-          \    \"\"\"\n    Quality gate: reads the CV ROC-AUC from the train component's\
-          \ JSON summary.\n    If it meets the threshold, the model resource name\
-          \ is forwarded to the\n    deploy component.  Otherwise the deploy step\
-          \ is skipped via dsl.If().\n\n    The model is already registered in Vertex\
-          \ AI Model Registry at this point\n    (the train component did it). This\
-          \ gate controls whether it gets *deployed*.\n    \"\"\"\n    import json\n\
-          \    import logging\n    from collections import namedtuple\n    import\
-          \ google.cloud.aiplatform as aip\n\n    logging.basicConfig(level=logging.INFO)\n\
-          \    logger = logging.getLogger(\"evaluate\")\n\n    with open(input_model.path)\
-          \ as fh:\n        summary = json.load(fh)\n\n    roc_auc       = float(summary.get(\"\
-          roc_auc\", 0))\n    resource_name = summary.get(\"resource_name\", \"\"\
-          )\n    approved      = roc_auc >= roc_auc_threshold\n\n    logger.info(\n\
-          \        f\"ROC-AUC={roc_auc:.4f}  threshold={roc_auc_threshold}  \"\n \
-          \       f\"\u2192 {'APPROVED \u2713' if approved else 'REJECTED \u2717'}\"\
-          \n    )\n\n    # Forward metadata so deploy_component knows which model\
-          \ to deploy\n    approved_model.metadata[\"resource_name\"] = resource_name\
+          \ str,\n    region: str,\n    roc_auc_threshold: float,\n    pr_auc_threshold:\
+          \ float,\n    f2_score_threshold: float,\n    recall_pos_threshold: float,\n\
+          \    approved_model: Output[Model],\n    eval_metrics: Output[Metrics],\n\
+          \    eval_clf_metrics: Output[ClassificationMetrics],\n) -> NamedTuple(\"\
+          EvalOutputs\", [(\"approved\", bool)]):\n    \"\"\"\n    Multi-metric quality\
+          \ gate.\n\n    Gate logic\n    \u2500\u2500\u2500\u2500\u2500\u2500\u2500\
+          \u2500\u2500\u2500\n    The model is APPROVED only when ALL four thresholds\
+          \ are met:\n      \u2022 ROC-AUC  \u2265 roc_auc_threshold    (overall discrimination)\n\
+          \      \u2022 PR-AUC   \u2265 pr_auc_threshold     (precision-recall trade-off\
+          \ on minority class)\n      \u2022 F2       \u2265 f2_score_threshold  \
+          \ (recall-weighted F-score; penalises missed failures)\n      \u2022 Recall(+)\u2265\
+          \ recall_pos_threshold (minimum detection rate for actual failures)\n\n\
+          \    Why multi-metric?\n    \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\
+          \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    A model can\
+          \ pass a single ROC-AUC gate while having unacceptably low\n    recall on\
+          \ the positive (failure) class \u2014 exactly the scenario we must\n   \
+          \ avoid in predictive maintenance. Gating on F2 and recall_pos directly\n\
+          \    closes that loophole.\n\n    KFP UI artefacts produced\n    \u2500\u2500\
+          \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\
+          \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n   \
+          \ eval_metrics     \u2192 per-metric cards + pass/fail margin.\n    eval_clf_metrics\
+          \ \u2192 confusion matrix forwarded from train summary.\n    \"\"\"\n  \
+          \  import json\n    import logging\n    from collections import namedtuple\n\
+          \n    logging.basicConfig(level=logging.INFO)\n    logger = logging.getLogger(\"\
+          evaluate\")\n\n    with open(input_model.path) as fh:\n        summary =\
+          \ json.load(fh)\n\n    roc_auc    = float(summary.get(\"roc_auc\",    0))\n\
+          \    pr_auc     = float(summary.get(\"pr_auc\",     0))\n    f2_score  \
+          \ = float(summary.get(\"f2_score\",   0))\n    recall_pos = float(summary.get(\"\
+          recall_pos\", 0))\n    recall_neg = float(summary.get(\"recall_neg\", 0))\n\
+          \    resource_name = summary.get(\"resource_name\", \"\")\n    cv_summary\
+          \    = summary.get(\"cv_summary\", {})\n\n    # \u2500\u2500 Gate decisions\
+          \ (all must pass) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\
+          \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\
+          \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\
+          \u2500\u2500\n    checks = {\n        \"roc_auc\":    (roc_auc,    roc_auc_threshold),\n\
+          \        \"pr_auc\":     (pr_auc,     pr_auc_threshold),\n        \"f2_score\"\
+          :   (f2_score,   f2_score_threshold),\n        \"recall_pos\": (recall_pos,\
+          \ recall_pos_threshold),\n    }\n\n    approved = all(value >= threshold\
+          \ for value, threshold in checks.values())\n\n    for metric, (value, threshold)\
+          \ in checks.items():\n        passed = value >= threshold\n        margin\
+          \ = value - threshold\n        logger.info(\n            f\"  {metric}:\
+          \ {value:.4f} {'\u2265' if passed else '<'} \"\n            f\"{threshold:.4f}\
+          \ (margin={margin:+.4f}) \u2192 {'PASS \u2713' if passed else 'FAIL \u2717\
+          '}\"\n        )\n\n    logger.info(\n        f\"Gate result: {'APPROVED\
+          \ \u2713' if approved else 'REJECTED \u2717'}\"\n    )\n\n    # \u2500\u2500\
+          \ Output[Metrics] \u2014 evaluation gate cards in Pipelines UI \u2500\u2500\
+          \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    eval_metrics.log_metric(\"\
+          roc_auc\",              roc_auc)\n    eval_metrics.log_metric(\"roc_auc_threshold\"\
+          ,    roc_auc_threshold)\n    eval_metrics.log_metric(\"roc_auc_margin\"\
+          ,       round(roc_auc    - roc_auc_threshold,    4))\n\n    eval_metrics.log_metric(\"\
+          pr_auc\",               pr_auc)\n    eval_metrics.log_metric(\"pr_auc_threshold\"\
+          ,     pr_auc_threshold)\n    eval_metrics.log_metric(\"pr_auc_margin\",\
+          \        round(pr_auc     - pr_auc_threshold,     4))\n\n    eval_metrics.log_metric(\"\
+          f2_score\",             f2_score)\n    eval_metrics.log_metric(\"f2_score_threshold\"\
+          ,   f2_score_threshold)\n    eval_metrics.log_metric(\"f2_score_margin\"\
+          ,      round(f2_score   - f2_score_threshold,   4))\n\n    eval_metrics.log_metric(\"\
+          recall_pos\",           recall_pos)\n    eval_metrics.log_metric(\"recall_pos_threshold\"\
+          , recall_pos_threshold)\n    eval_metrics.log_metric(\"recall_pos_margin\"\
+          ,    round(recall_pos - recall_pos_threshold, 4))\n\n    eval_metrics.log_metric(\"\
+          recall_neg\",           recall_neg)\n    eval_metrics.log_metric(\"approved\"\
+          ,             float(approved))\n\n    # \u2500\u2500 Output[ClassificationMetrics]\
+          \ \u2014 visual panel in Pipelines UI \u2500\u2500\u2500\u2500\u2500\n \
+          \   n_folds = int(cv_summary.get(\"cv_roc_auc_mean\", 0) and\n         \
+          \         sum(1 for k in cv_summary if k.startswith(\"fold_\") and k.endswith(\"\
+          _tp\")))\n    # Fall back: reconstruct from aggregated confusion matrix\
+          \ if available\n    agg_tn = int(cv_summary.get(\"fold_1_tn\", 0))  # just\
+          \ fold 1 if summary missing\n    agg_fp = int(cv_summary.get(\"fold_1_fp\"\
+          , 0))\n    agg_fn = int(cv_summary.get(\"fold_1_fn\", 0))\n    agg_tp =\
+          \ int(cv_summary.get(\"fold_1_tp\", 0))\n    # Sum all folds for the aggregate\
+          \ view\n    folds_found = [k.split(\"_\")[1] for k in cv_summary if k.startswith(\"\
+          fold_\") and k.endswith(\"_tp\")]\n    if folds_found:\n        agg_tn =\
+          \ int(sum(cv_summary.get(f\"fold_{f}_tn\", 0) for f in folds_found))\n \
+          \       agg_fp = int(sum(cv_summary.get(f\"fold_{f}_fp\", 0) for f in folds_found))\n\
+          \        agg_fn = int(sum(cv_summary.get(f\"fold_{f}_fn\", 0) for f in folds_found))\n\
+          \        agg_tp = int(sum(cv_summary.get(f\"fold_{f}_tp\", 0) for f in folds_found))\n\
+          \n    eval_clf_metrics.log_confusion_matrix(\n        categories=[\"No Failure\
+          \ (0)\", \"Will Fail (1)\"],\n        matrix=[[agg_tn, agg_fp], [agg_fn,\
+          \ agg_tp]],\n    )\n\n    fpr = 1.0 - recall_neg\n    eval_clf_metrics.log_roc_curve(\n\
+          \        fpr=[0.0, round(fpr, 4), 1.0],\n        tpr=[0.0, round(recall_pos,\
+          \ 4), 1.0],\n        threshold=[1.0, 0.5, 0.0],\n    )\n\n    # \u2500\u2500\
+          \ Forward model to deploy component \u2500\u2500\u2500\u2500\u2500\u2500\
+          \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\
+          \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\
+          \u2500\u2500\n    approved_model.metadata[\"resource_name\"] = resource_name\
           \ if approved else \"\"\n    approved_model.metadata[\"roc_auc\"]      \
-          \ = roc_auc\n    approved_model.metadata[\"approved\"]      = approved\n\
-          \n    # Write the same summary so the artefact path is not empty\n    with\
-          \ open(approved_model.path, \"w\") as fh:\n        json.dump({**summary,\
-          \ \"approved\": approved}, fh)\n\n    EvalOutputs = namedtuple(\"EvalOutputs\"\
-          , [\"approved\"])\n    return EvalOutputs(approved=approved)\n\n"
+          \ = roc_auc\n    approved_model.metadata[\"pr_auc\"]        = pr_auc\n \
+          \   approved_model.metadata[\"f2_score\"]      = f2_score\n    approved_model.metadata[\"\
+          recall_pos\"]    = recall_pos\n    approved_model.metadata[\"approved\"\
+          ]      = approved\n\n    with open(approved_model.path, \"w\") as fh:\n\
+          \        json.dump({**summary, \"approved\": approved}, fh, indent=2)\n\n\
+          \    EvalOutputs = namedtuple(\"EvalOutputs\", [\"approved\"])\n    return\
+          \ EvalOutputs(approved=approved)\n\n"
         image: us-central1-docker.pkg.dev/abiding-kingdom-491823-b0/predictive-maintenance-repo/predictive-maintenance:v1
     exec-preprocess-component:
       container:
@@ -239,45 +334,110 @@ deploymentSpec:
           \    bq_dataset: str,\n    bq_table: str,\n    n_estimators: int,\n    max_depth:\
           \ int,\n    learning_rate: float,\n    subsample: float,\n    colsample_bytree:\
           \ float,\n    n_cv_splits: int,\n    output_model: Output[Model],\n    output_metrics:\
-          \ Output[Metrics],\n) -> NamedTuple(\"TrainOutputs\", [(\"roc_auc\", float),\
-          \ (\"f1_macro\", float), (\"artifact_uri\", str)]):\n    \"\"\"\n    Calls\
-          \ XGBoostTrainer.train():\n      \u2022 Reads features directly from BigQuery\
-          \ (no local CSV)\n      \u2022 TimeSeriesSplit cross-validation\n      \u2022\
-          \ Saves model.bst + scaler.pkl + feature_names.json to GCS\n      \u2022\
-          \ Logs params + metrics to a Vertex AI Experiment run\n      \u2022 Registers\
-          \ the model in Vertex AI Model Registry\n      \u2022 Returns CV metrics\
-          \ for the evaluation gate\n\n    trainer.train() returns a dict \u2014 artifact_uri\
-          \ and resource_name are\n    taken from that dict directly, since aiplatform.Model\
-          \ does not expose\n    artifact_uri as an attribute after Model.upload().\n\
-          \    \"\"\"\n    import os\n    import json\n    from collections import\
-          \ namedtuple\n\n    os.environ[\"GCP_PROJECT_ID\"]    = project_id\n   \
-          \ os.environ[\"GCP_REGION\"]        = region\n    os.environ[\"GCS_BUCKET_NAME\"\
-          ]   = bucket_name\n    os.environ[\"MODEL_NAME\"]        = model_name\n\
-          \    os.environ[\"VERTEX_EXPERIMENT\"] = vertex_experiment\n    os.environ[\"\
-          BQ_DATASET\"]        = bq_dataset\n    os.environ[\"BQ_TABLE\"]        \
-          \  = bq_table\n\n    from src.model.xg_boost_trainer import XGBoostTrainer\n\
+          \ Output[Metrics],\n    output_clf_metrics: Output[ClassificationMetrics],\n\
+          ) -> NamedTuple(\n    \"TrainOutputs\",\n    [\n        (\"roc_auc\", float),\n\
+          \        (\"pr_auc\", float),\n        (\"f2_score\", float),\n        (\"\
+          recall_pos\", float),\n        (\"recall_neg\", float),\n        (\"artifact_uri\"\
+          , str),\n    ],\n):\n    \"\"\"\n    Trains XGBoost with TimeSeriesSplit\
+          \ CV.\n\n    KFP UI artefacts produced\n    \u2500\u2500\u2500\u2500\u2500\
+          \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\
+          \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    output_metrics   \
+          \    \u2192 scalar cards in the Vertex AI Pipelines run view.\n        \
+          \                   Includes mean \xB1 std for every CV metric.\n    output_clf_metrics\
+          \   \u2192 Confusion matrix + ROC curve panels rendered\n              \
+          \             natively in the Pipelines UI (no external tool).\n    output_model\
+          \ (JSON)  \u2192 handoff payload for evaluate_component.\n    \"\"\"\n \
+          \   import os\n    import json\n    import numpy as np\n    from collections\
+          \ import namedtuple\n\n    os.environ[\"GCP_PROJECT_ID\"]   = project_id\n\
+          \    os.environ[\"GCP_REGION\"]       = region\n    os.environ[\"GCS_BUCKET_NAME\"\
+          ]  = bucket_name\n    os.environ[\"MODEL_NAME\"]       = model_name\n  \
+          \  os.environ[\"VERTEX_EXPERIMENT\"]= vertex_experiment\n    os.environ[\"\
+          BQ_DATASET\"]       = bq_dataset\n    os.environ[\"BQ_TABLE\"]         =\
+          \ bq_table\n\n    from src.model.xg_boost_trainer import XGBoostTrainer\n\
           \n    trainer = XGBoostTrainer(\n        n_estimators     = n_estimators,\n\
           \        max_depth        = max_depth,\n        learning_rate    = learning_rate,\n\
           \        subsample        = subsample,\n        colsample_bytree = colsample_bytree,\n\
           \        n_cv_splits      = n_cv_splits,\n        bq_dataset       = bq_dataset,\n\
-          \        bq_table         = bq_table,\n    )\n\n    # train() returns a\
-          \ dict: {vertex_model, resource_name, artifact_uri, cv_metrics}\n    result\
-          \ = trainer.train()\n\n    resource_name = result[\"resource_name\"]\n \
-          \   artifact_uri  = result[\"artifact_uri\"]\n    cv_metrics    = result[\"\
-          cv_metrics\"]\n    roc_auc       = float(cv_metrics.get(\"cv_roc_auc\",\
-          \ 0.0))\n    f1_macro      = float(cv_metrics.get(\"cv_f1_macro\", 0.0))\n\
-          \n    # Surface metrics in the KFP / Vertex AI Pipelines UI\n    output_metrics.log_metric(\"\
-          cv_roc_auc\", roc_auc)\n    output_metrics.log_metric(\"cv_f1_macro\", f1_macro)\n\
-          \    output_metrics.log_metric(\"cv_recall_1\", float(cv_metrics.get(\"\
-          cv_recall_1\", 0.0)))\n\n    # Write JSON summary so evaluate_component\
-          \ can read it\n    summary = {\n        \"resource_name\": resource_name,\n\
-          \        \"artifact_uri\":  artifact_uri,\n        \"roc_auc\":       roc_auc,\n\
-          \        \"f1_macro\":      f1_macro,\n    }\n    with open(output_model.path,\
-          \ \"w\") as fh:\n        json.dump(summary, fh)\n\n    output_model.metadata[\"\
-          resource_name\"] = resource_name\n    output_model.metadata[\"artifact_uri\"\
-          ]  = artifact_uri\n\n    TrainOutputs = namedtuple(\"TrainOutputs\", [\"\
-          roc_auc\", \"f1_macro\", \"artifact_uri\"])\n    return TrainOutputs(roc_auc=roc_auc,\
-          \ f1_macro=f1_macro, artifact_uri=artifact_uri)\n\n"
+          \        bq_table         = bq_table,\n    )\n\n    # result keys: vertex_model,\
+          \ resource_name, artifact_uri, cv_summary, cv_metrics\n    result      =\
+          \ trainer.tune()\n    resource_name = result[\"resource_name\"]\n    artifact_uri\
+          \  = result[\"artifact_uri\"]\n    cv_summary    = result[\"cv_summary\"\
+          ]   # full flat dict (mean + std + per-fold)\n    cv_metrics    = result[\"\
+          cv_metrics\"]   # back-compat aliases (plain mean values)\n\n    # \u2500\
+          \u2500 Extract headline metrics \u2500\u2500\u2500\u2500\u2500\u2500\u2500\
+          \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\
+          \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\
+          \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    roc_auc\
+          \    = float(cv_metrics.get(\"cv_roc_auc\",  0.0))\n    pr_auc     = float(cv_metrics.get(\"\
+          cv_pr_auc\",   0.0))\n    f2_score   = float(cv_metrics.get(\"cv_f2_score\"\
+          , 0.0))\n    f1_macro   = float(cv_metrics.get(\"cv_f1_macro\", 0.0))\n\
+          \    recall_pos = float(cv_metrics.get(\"cv_recall_1\", 0.0))\n    recall_neg\
+          \ = float(cv_metrics.get(\"cv_recall_0\", 0.0))\n    precision_pos = float(cv_summary.get(\"\
+          cv_precision_1_mean\", 0.0))\n\n    roc_auc_std  = float(cv_summary.get(\"\
+          cv_roc_auc_std\",  0.0))\n    pr_auc_std   = float(cv_summary.get(\"cv_pr_auc_std\"\
+          ,   0.0))\n    f2_std       = float(cv_summary.get(\"cv_f2_score_std\",\
+          \ 0.0))\n    f1_std       = float(cv_summary.get(\"cv_f1_macro_std\", 0.0))\n\
+          \    recall_pos_std = float(cv_summary.get(\"cv_recall_1_std\", 0.0))\n\
+          \    recall_neg_std = float(cv_summary.get(\"cv_recall_0_std\", 0.0))\n\n\
+          \    # \u2500\u2500 Output[Metrics] \u2014 scalar cards in Pipelines UI\
+          \ \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\
+          \u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    # Aggregate means\n    output_metrics.log_metric(\"\
+          cv_roc_auc_mean\",      roc_auc)\n    output_metrics.log_metric(\"cv_pr_auc_mean\"\
+          ,        pr_auc)\n    output_metrics.log_metric(\"cv_f2_score_mean\",  \
+          \    f2_score)\n    output_metrics.log_metric(\"cv_f1_macro_mean\",    \
+          \  f1_macro)\n    output_metrics.log_metric(\"cv_recall_pos_mean\",    recall_pos)\n\
+          \    output_metrics.log_metric(\"cv_recall_neg_mean\",    recall_neg)\n\
+          \    output_metrics.log_metric(\"cv_precision_pos_mean\", precision_pos)\n\
+          \n    # Std deviations \u2014 a high std on recall_pos flags instability\n\
+          \    output_metrics.log_metric(\"cv_roc_auc_std\",      roc_auc_std)\n \
+          \   output_metrics.log_metric(\"cv_pr_auc_std\",        pr_auc_std)\n  \
+          \  output_metrics.log_metric(\"cv_f2_score_std\",      f2_std)\n    output_metrics.log_metric(\"\
+          cv_f1_macro_std\",      f1_std)\n    output_metrics.log_metric(\"cv_recall_pos_std\"\
+          ,    recall_pos_std)\n    output_metrics.log_metric(\"cv_recall_neg_std\"\
+          ,    recall_neg_std)\n\n    # Per-fold ROC-AUC (quick variance inspection\
+          \ without opening the run)\n    for fold in range(1, n_cv_splits + 1):\n\
+          \        fold_roc = float(cv_summary.get(f\"fold_{fold}_roc_auc\", 0.0))\n\
+          \        fold_pr  = float(cv_summary.get(f\"fold_{fold}_pr_auc\",  0.0))\n\
+          \        fold_f2  = float(cv_summary.get(f\"fold_{fold}_f2_score\",0.0))\n\
+          \        output_metrics.log_metric(f\"fold_{fold}_roc_auc\", fold_roc)\n\
+          \        output_metrics.log_metric(f\"fold_{fold}_pr_auc\",  fold_pr)\n\
+          \        output_metrics.log_metric(f\"fold_{fold}_f2_score\",fold_f2)\n\n\
+          \    # \u2500\u2500 Output[ClassificationMetrics] \u2014 visual panels in\
+          \ Pipelines UI \u2500\u2500\u2500\u2500\n    # Aggregate confusion matrix\
+          \ from fold data\n    agg_tn = int(sum(cv_summary.get(f\"fold_{f}_tn\",\
+          \ 0) for f in range(1, n_cv_splits + 1)))\n    agg_fp = int(sum(cv_summary.get(f\"\
+          fold_{f}_fp\", 0) for f in range(1, n_cv_splits + 1)))\n    agg_fn = int(sum(cv_summary.get(f\"\
+          fold_{f}_fn\", 0) for f in range(1, n_cv_splits + 1)))\n    agg_tp = int(sum(cv_summary.get(f\"\
+          fold_{f}_tp\", 0) for f in range(1, n_cv_splits + 1)))\n\n    output_clf_metrics.log_confusion_matrix(\n\
+          \        categories=[\"No Failure (0)\", \"Will Fail (1)\"],\n        matrix=[[agg_tn,\
+          \ agg_fp], [agg_fn, agg_tp]],\n    )\n\n    # ROC curve \u2014 reconstruct\
+          \ from aggregate TPR/FPR approximation.\n    # A production pipeline would\
+          \ pass the full threshold sweep from the\n    # trainer; here we log the\
+          \ mean operating point + convex hull endpoints\n    # which is sufficient\
+          \ for the Pipelines UI panel.\n    tpr = recall_pos\n    fpr = 1.0 - recall_neg\n\
+          \    output_clf_metrics.log_roc_curve(\n        fpr=[0.0, round(fpr, 4),\
+          \ 1.0],\n        tpr=[0.0, round(tpr, 4), 1.0],\n        threshold=[1.0,\
+          \ 0.5, 0.0],\n    )\n\n    # \u2500\u2500 JSON handoff for evaluate_component\
+          \ \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\
+          \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\
+          \u2500\u2500\u2500\u2500\u2500\u2500\n    summary = {\n        \"resource_name\"\
+          : resource_name,\n        \"artifact_uri\":  artifact_uri,\n        # headline\
+          \ metrics (evaluate_component reads these)\n        \"roc_auc\":       roc_auc,\n\
+          \        \"pr_auc\":        pr_auc,\n        \"f2_score\":      f2_score,\n\
+          \        \"f1_macro\":      f1_macro,\n        \"recall_pos\":    recall_pos,\n\
+          \        \"recall_neg\":    recall_neg,\n        # full summary for any\
+          \ downstream component that wants it\n        \"cv_summary\":    cv_summary,\n\
+          \    }\n    with open(output_model.path, \"w\") as fh:\n        json.dump(summary,\
+          \ fh, indent=2)\n\n    output_model.metadata[\"resource_name\"] = resource_name\n\
+          \    output_model.metadata[\"artifact_uri\"]  = artifact_uri\n    output_model.metadata[\"\
+          cv_roc_auc\"]    = roc_auc\n    output_model.metadata[\"cv_pr_auc\"]   \
+          \  = pr_auc\n    output_model.metadata[\"cv_f2_score\"]   = f2_score\n\n\
+          \    TrainOutputs = namedtuple(\n        \"TrainOutputs\",\n        [\"\
+          roc_auc\", \"pr_auc\", \"f2_score\", \"recall_pos\", \"recall_neg\", \"\
+          artifact_uri\"],\n    )\n    return TrainOutputs(\n        roc_auc     \
+          \ = roc_auc,\n        pr_auc       = pr_auc,\n        f2_score     = f2_score,\n\
+          \        recall_pos   = recall_pos,\n        recall_neg   = recall_neg,\n\
+          \        artifact_uri = artifact_uri,\n    )\n\n"
         image: us-central1-docker.pkg.dev/abiding-kingdom-491823-b0/predictive-maintenance-repo/predictive-maintenance:v1
         resources:
           cpuLimit: 4.0
@@ -293,8 +453,7 @@ root:
   dag:
     tasks:
       evaluate-component:
-        cachingOptions:
-          enableCache: true
+        cachingOptions: {}
         componentRef:
           name: comp-evaluate-component
         dependentTasks:
@@ -306,8 +465,14 @@ root:
                 outputArtifactKey: output_model
                 producerTask: train-component
           parameters:
+            f2_score_threshold:
+              componentInputParameter: f2_score_threshold
+            pr_auc_threshold:
+              componentInputParameter: pr_auc_threshold
             project_id:
               componentInputParameter: project_id
+            recall_pos_threshold:
+              componentInputParameter: recall_pos_threshold
             region:
               componentInputParameter: region
             roc_auc_threshold:
@@ -334,8 +499,7 @@ root:
         taskInfo:
           name: Feature Engineering
       train-component:
-        cachingOptions:
-          enableCache: true
+        cachingOptions: {}
         componentRef:
           name: comp-train-component
         dependentTasks:
@@ -390,6 +554,10 @@ root:
         defaultValue: predictive-maintenance-endpoint
         isOptional: true
         parameterType: STRING
+      f2_score_threshold:
+        defaultValue: 0.4
+        isOptional: true
+        parameterType: NUMBER_DOUBLE
       learning_rate:
         defaultValue: 0.05
         isOptional: true
@@ -414,8 +582,16 @@ root:
         defaultValue: 300.0
         isOptional: true
         parameterType: NUMBER_INTEGER
+      pr_auc_threshold:
+        defaultValue: 0.5
+        isOptional: true
+        parameterType: NUMBER_DOUBLE
       project_id:
         parameterType: STRING
+      recall_pos_threshold:
+        defaultValue: 0.6
+        isOptional: true
+        parameterType: NUMBER_DOUBLE
       region:
         defaultValue: us-central1
         isOptional: true
@@ -429,7 +605,7 @@ root:
         isOptional: true
         parameterType: NUMBER_DOUBLE
       target_window_size:
-        defaultValue: 30.0
+        defaultValue: 7.0
         isOptional: true
         parameterType: NUMBER_INTEGER
       vertex_experiment:

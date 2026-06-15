@@ -7,7 +7,9 @@ aiohttp==3.13.5
 aiosignal==1.4.0
     # via aiohttp
 alembic==1.16.4
-    # via mlflow
+    # via
+    #   mlflow
+    #   optuna
 annotated-types==0.7.0
     # via pydantic
 anyio==4.9.0
@@ -55,7 +57,11 @@ cloudpickle==3.1.1
 colorama==0.4.6 ; sys_platform == 'win32'
     # via
     #   click
+    #   colorlog
     #   ipython
+    #   tqdm
+colorlog==6.10.1
+    # via optuna
 comm==0.2.2
     # via ipykernel
 contourpy==1.3.2
@@ -287,6 +293,7 @@ numpy==2.3.1
     #   db-dtypes
     #   matplotlib
     #   mlflow
+    #   optuna
     #   pandas
     #   pandas-gbq
     #   scikit-learn
@@ -308,6 +315,8 @@ opentelemetry-sdk==1.35.0
     # via mlflow-skinny
 opentelemetry-semantic-conventions==0.56b0
     # via opentelemetry-sdk
+optuna==4.9.0
+    # via predictive-maintenance
 packaging==25.0
     # via
     #   db-dtypes
@@ -318,6 +327,7 @@ packaging==25.0
     #   ipykernel
     #   matplotlib
     #   mlflow-skinny
+    #   optuna
     #   pandas-gbq
 pandas==2.3.1
     # via
@@ -421,6 +431,7 @@ pyyaml==6.0.2
     #   kfp
     #   kubernetes
     #   mlflow-skinny
+    #   optuna
 pyzmq==27.0.0
     # via
     #   ipykernel
@@ -484,6 +495,7 @@ sqlalchemy==2.0.41
     # via
     #   alembic
     #   mlflow
+    #   optuna
 sqlparse==0.5.3
     # via mlflow-skinny
 stack-data==0.6.3
@@ -500,6 +512,8 @@ tornado==6.5.1
     # via
     #   ipykernel
     #   jupyter-client
+tqdm==4.68.2
+    # via optuna
 traitlets==5.14.3
     # via
     #   comm
